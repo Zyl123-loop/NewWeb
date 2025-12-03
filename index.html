@@ -6,37 +6,58 @@
     <title>JD AR Hand Interaction</title>
     <style>
         body { margin: 0; padding: 0; overflow: hidden; background: #000; font-family: sans-serif; }
-        /* 隐藏原始视频元素，我们手动绘制 */
-        #input-video { display: none; }
+        
+        /* 
+           关键修复：不能使用 display: none 
+           改用 opacity: 0 和 z-index: -1 把它藏在画布后面
+           这样浏览器认为视频正在播放，才会产生数据
+        */
+        #input-video { 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover;
+            opacity: 0; 
+            z-index: -1; 
+        }
         
         canvas { display: block; position: absolute; top: 0; left: 0; }
 
         #loading {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            color: white; font-size: 18px; z-index: 10; text-align: center;
-            background: rgba(0,0,0,0.7); padding: 20px; border-radius: 10px;
+            color: white; font-size: 16px; z-index: 10; text-align: center;
+            background: rgba(0,0,0,0.8); padding: 20px; border-radius: 10px;
+            width: 80%; max-width: 300px;
         }
         #start-btn {
             display: none; margin-top: 20px; padding: 12px 24px;
             background: #e1251b; /* JD Red */
             color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px;
+            width: 100%;
+        }
+        #error-msg {
+            color: #ff4d4f; margin-top: 10px; font-size: 12px; display: none;
         }
     </style>
     
     <!-- 引入 MediaPipe Hands -->
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <!-- 移除了 camera_utils，使用原生 API -->
 </head>
 <body>
 
     <div id="loading">
-        正在加载手势识别模型...<br>
+        <div id="status-text">正在加载资源...</div>
+        <div id="error-msg"></div>
         <button id="start-btn">开启摄像头体验</button>
     </div>
 
-    <video id="input-video" playsinline></video>
+    <!-- 视频元素 (现在是隐藏但在渲染的) -->
+    <video id="input-video" playsinline muted autoplay></video>
     
-    <!-- 离屏 Canvas，用于生成手部碰撞蒙版 -->
+    <!-- 离屏 Canvas -->
     <canvas id="mask-canvas" style="display:none;"></canvas>
     <!-- 主 Canvas -->
     <canvas id="main-canvas"></canvas>
@@ -46,16 +67,18 @@
     const canvas = document.getElementById('main-canvas');
     const ctx = canvas.getContext('2d');
     
-    // 蒙版 Canvas：只在这个上面画白色的手，用于碰撞检测
     const maskCanvas = document.getElementById('mask-canvas');
     const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
     
     const loadingDiv = document.getElementById('loading');
+    const statusText = document.getElementById('status-text');
     const startBtn = document.getElementById('start-btn');
+    const errorMsg = document.getElementById('error-msg');
 
     let width, height;
     let particlesArray = [];
-    let handMaskData = null; // 存储手部蒙版像素数据
+    let handMaskData = null;
+    let cameraRunning = false;
 
     // 调整画布大小
     function resize() {
@@ -65,12 +88,12 @@
         canvas.height = height;
         maskCanvas.width = width;
         maskCanvas.height = height;
-        initParticles(); // 重新生成 JD 文字
+        initParticles();
     }
     window.addEventListener('resize', resize);
 
     // ----------------------
-    // 1. 粒子系统类
+    // 1. 粒子系统 (JD)
     // ----------------------
     class Particle {
         constructor(x, y) {
@@ -79,11 +102,8 @@
             this.x = Math.random() * width; 
             this.y = Math.random() * height;
             this.size = 2;
-            
-            // JD 红色系
             const colors = ['#e1251b', '#f5f5f5', '#ff9999']; 
             this.color = colors[Math.floor(Math.random() * colors.length)];
-            
             this.vx = 0;
             this.vy = 0;
             this.friction = 0.92; 
@@ -98,78 +118,54 @@
         }
 
         update() {
-            // 计算与原点的距离
             let dx = this.originX - this.x;
             let dy = this.originY - this.y;
             
             let isTouchingHand = false;
-
-            // 检查当前粒子是否碰到了手 (查询 handMaskData)
             const pX = Math.floor(this.x);
             const pY = Math.floor(this.y);
 
+            // 读取蒙版数据进行碰撞检测
             if (pX >= 0 && pX < width && pY >= 0 && pY < height && handMaskData) {
-                // 读取 mask 画布的红色通道
                 const index = (pY * width + pX) * 4;
-                const brightness = handMaskData[index]; 
-                
-                // 如果像素是白色的（亮度高），说明碰到了手
-                if (brightness > 100) {
+                if (handMaskData[index] > 100) {
                     isTouchingHand = true;
                 }
             }
 
             if (isTouchingHand) {
-                // 碰到手：强力排斥
                 const angle = Math.random() * Math.PI * 2;
-                const pushForce = 8; // 弹开力度
+                const pushForce = 8; 
                 this.vx += Math.cos(angle) * pushForce;
                 this.vy += Math.sin(angle) * pushForce;
-                this.size = 5; // 变大高亮
+                this.size = 5;
             } else {
-                // 没碰到：飞回原位
                 this.vx += dx * this.ease * 0.1;
                 this.vy += dy * this.ease * 0.1;
-                // 稍微抖动一点，增加灵动感
-                if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
-                    this.size = 2;
-                } else {
-                    this.size = 2.5;
-                }
+                this.size = (Math.abs(dx) < 1 && Math.abs(dy) < 1) ? 2 : 2.5;
             }
 
             this.vx *= this.friction;
             this.vy *= this.friction;
-
             this.x += this.vx;
             this.y += this.vy;
         }
     }
 
-    // ----------------------
-    // 2. 初始化粒子 (生成 "JD" 文字)
-    // ----------------------
     function initParticles() {
         particlesArray = [];
-        ctx.clearRect(0, 0, width, height); // 临时清空用于读取文字
-
+        ctx.clearRect(0, 0, width, height);
         ctx.fillStyle = 'white';
-        // 字体尽量大
         let fontSize = width / 2.5; 
         if (fontSize > 300) fontSize = 300;
-        
-        ctx.font = `900 ${fontSize}px Arial`; // 900 是最粗体
+        ctx.font = `900 ${fontSize}px Arial`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        
-        // 绘制 "JD"
         ctx.fillText('JD', width / 2, height / 2);
 
-        // 获取文字像素
         const textCoordinates = ctx.getImageData(0, 0, width, height);
-        
-        // 采样生成粒子
-        const step = 6; // 密度：数字越小粒子越多（如果手机卡顿，请改成 8 或 10）
+        // 如果卡顿，将 step 改大，比如 8 或 10
+        const step = 6; 
         
         for (let y = 0; y < height; y += step) {
             for (let x = 0; x < width; x += step) {
@@ -183,77 +179,54 @@
     }
 
     // ----------------------
-    // 3. MediaPipe Hands 设置
+    // 2. MediaPipe Hands 逻辑
     // ----------------------
-    
-    // 辅助函数：在 maskCanvas 上画粗线，代表手指
     function drawHandOnMask(landmarks) {
         maskCtx.fillStyle = 'white';
         maskCtx.strokeStyle = 'white';
-        maskCtx.lineWidth = 40; // 这里的宽度决定了“手”的碰撞体积大小，稍微粗一点体验更好
+        maskCtx.lineWidth = 40; 
         maskCtx.lineCap = 'round';
         maskCtx.lineJoin = 'round';
 
-        // 手指连接顺序
         const connections = [
-            [0, 1], [1, 2], [2, 3], [3, 4], // 拇指
-            [0, 5], [5, 6], [6, 7], [7, 8], // 食指
-            [0, 9], [9, 10], [10, 11], [11, 12], // 中指
-            [0, 13], [13, 14], [14, 15], [15, 16], // 无名指
-            [0, 17], [17, 18], [18, 19], [19, 20], // 小指
-            [5, 9], [9, 13], [13, 17] // 手掌横向
+            [0, 1], [1, 2], [2, 3], [3, 4],
+            [0, 5], [5, 6], [6, 7], [7, 8],
+            [0, 9], [9, 10], [10, 11], [11, 12],
+            [0, 13], [13, 14], [14, 15], [15, 16],
+            [0, 17], [17, 18], [18, 19], [19, 20],
+            [5, 9], [9, 13], [13, 17]
         ];
 
         maskCtx.beginPath();
-        
-        // 绘制骨骼连线
         for (let i = 0; i < connections.length; i++) {
-            const startIdx = connections[i][0];
-            const endIdx = connections[i][1];
-            
-            const x1 = landmarks[startIdx].x * width;
-            const y1 = landmarks[startIdx].y * height;
-            const x2 = landmarks[endIdx].x * width;
-            const y2 = landmarks[endIdx].y * height;
-            
-            maskCtx.moveTo(x1, y1);
-            maskCtx.lineTo(x2, y2);
+            const start = landmarks[connections[i][0]];
+            const end = landmarks[connections[i][1]];
+            maskCtx.moveTo(start.x * width, start.y * height);
+            maskCtx.lineTo(end.x * width, end.y * height);
         }
         maskCtx.stroke();
-        
-        // 在指尖画大圆，增加互动灵敏度
-        const tips = [4, 8, 12, 16, 20];
-        tips.forEach(idx => {
-            const x = landmarks[idx].x * width;
-            const y = landmarks[idx].y * height;
-            maskCtx.beginPath();
-            maskCtx.arc(x, y, 25, 0, Math.PI * 2);
-            maskCtx.fill();
-        });
     }
 
     function onResults(results) {
-        // 1. 绘制背景视频 (要求：摄像头内容作为背景)
+        // 1. 绘制背景 (摄像头画面)
         ctx.save();
-        // 镜像翻转绘制，因为这是前置摄像头
         ctx.translate(width, 0);
         ctx.scale(-1, 1);
-        ctx.drawImage(results.image, 0, 0, width, height);
+        // 确保 image 存在
+        if (results.image) {
+            ctx.drawImage(results.image, 0, 0, width, height);
+        }
         ctx.restore();
 
-        // 给背景加一层半透明蒙层，让粒子更明显，否则背景太乱看不清 JD
+        // 背景遮罩
         ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
         ctx.fillRect(0, 0, width, height);
 
-        // 2. 处理手部蒙版 (用于物理计算)
+        // 2. 绘制隐形蒙版 (手部)
         maskCtx.clearRect(0, 0, width, height);
-        
-        // 注意：MediaPipe Hands 返回的数据是镜像的还是非镜像的取决于配置
-        // 为了和主画面(已镜像)对齐，MaskCanvas 也需要镜像绘制
         maskCtx.save();
         maskCtx.translate(width, 0);
         maskCtx.scale(-1, 1);
-
         if (results.multiHandLandmarks) {
             for (const landmarks of results.multiHandLandmarks) {
                 drawHandOnMask(landmarks);
@@ -261,13 +234,13 @@
         }
         maskCtx.restore();
 
-        // 3. 获取蒙版数据供粒子使用
+        // 3. 提取碰撞数据
         handMaskData = maskCtx.getImageData(0, 0, width, height).data;
 
-        // 4. 绘制粒子
-        particlesArray.forEach(particle => {
-            particle.update(); // 更新位置 (检查 handMaskData)
-            particle.draw();   // 绘制
+        // 4. 粒子更新
+        particlesArray.forEach(p => {
+            p.update();
+            p.draw();
         });
     }
 
@@ -276,37 +249,77 @@
     }});
 
     hands.setOptions({
-        maxNumHands: 2, // 最多识别两只手
-        modelComplexity: 1, // 1 是标准精度，0 是超快但精度低
+        maxNumHands: 2,
+        modelComplexity: 1,
         minDetectionConfidence: 0.5,
         minTrackingConfidence: 0.5
     });
-
     hands.onResults(onResults);
 
     // ----------------------
-    // 4. 启动逻辑
+    // 3. 摄像头启动与循环 (原生API修复版)
     // ----------------------
-    setTimeout(() => {
-        loadingDiv.innerHTML = "手势模型就绪<br>";
+    async function startCamera() {
+        try {
+            statusText.innerText = "正在请求摄像头权限...";
+            
+            // 使用原生 getUserMedia
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: false,
+                video: {
+                    facingMode: 'user', // 优先前置
+                    // 不要设置具体的 width/height，让系统自动匹配最佳分辨率
+                    // 这样可以避免某些手机因分辨率不支持而黑屏
+                }
+            });
+
+            videoElement.srcObject = stream;
+            
+            // 等待视频元数据加载，确保能获取尺寸
+            videoElement.onloadedmetadata = () => {
+                videoElement.play();
+                statusText.innerText = "初始化模型...";
+                cameraRunning = true;
+                processVideo(); // 开始逐帧处理
+            };
+
+        } catch (err) {
+            console.error(err);
+            statusText.innerText = "无法启动摄像头";
+            errorMsg.style.display = 'block';
+            errorMsg.innerText = "错误详情: " + err.name + " - " + err.message + "\n请确保在 HTTPS 环境下运行，并允许摄像头权限。";
+        }
+    }
+
+    // 每一帧手动发送给 MediaPipe
+    async function processVideo() {
+        if (!cameraRunning) return;
+
+        if (videoElement.currentTime > 0 && !videoElement.paused && !videoElement.ended) {
+            try {
+                // 将视频帧发给模型
+                await hands.send({image: videoElement});
+            } catch (error) {
+                console.error("MediaPipe error:", error);
+            }
+        }
+        // 循环调用
+        requestAnimationFrame(processVideo);
+    }
+
+    // ----------------------
+    // 4. 初始化
+    // ----------------------
+    hands.initialize().then(() => {
+        statusText.innerText = "模型准备就绪";
         loadingDiv.appendChild(startBtn);
         startBtn.style.display = "inline-block";
-    }, 1500);
+    });
 
-    startBtn.addEventListener('click', async () => {
+    startBtn.addEventListener('click', () => {
         loadingDiv.style.display = 'none';
         resize();
-
-        const camera = new Camera(videoElement, {
-            onFrame: async () => {
-                await hands.send({image: videoElement});
-            },
-            width: 1280,
-            height: 720,
-            facingMode: 'user'
-        });
-        
-        await camera.start();
+        startCamera();
     });
 
 </script>
