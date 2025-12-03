@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AR Particle Interaction</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        /* 视频元素隐藏，我们只处理数据 */
+        #input-video { display: none; }
+        /* 画布全屏 */
+        canvas { display: block; position: absolute; top: 0; left: 0; }
+        
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-size: 20px; z-index: 10; text-align: center;
+        }
+        #start-btn {
+            display: none; margin-top: 20px; padding: 10px 20px;
+            background: #4285f4; color: white; border: none; border-radius: 5px; cursor: pointer;
+        }
+    </style>
+    <!-- 引入 MediaPipe Selfie Segmentation -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+
+    <div id="loading">
+        正在加载模型...<br>
+        <button id="start-btn">开启摄像头体验</button>
+    </div>
+
+    <!-- 原始视频流 (隐藏) -->
+    <video id="input-video" playsinline></video>
+    
+    <!-- 离屏 Canvas 用于处理蒙版数据 -->
+    <canvas id="mask-canvas" style="display:none;"></canvas>
+    <!-- 主显示 Canvas -->
+    <canvas id="main-canvas"></canvas>
+
+<script>
+    const videoElement = document.getElementById('input-video');
+    const canvas = document.getElementById('main-canvas');
+    const ctx = canvas.getContext('2d');
+    const maskCanvas = document.getElementById('mask-canvas');
+    const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    
+    const loadingDiv = document.getElementById('loading');
+    const startBtn = document.getElementById('start-btn');
+
+    let width, height;
+    let particlesArray = [];
+    let segmentationResults = null;
+
+    // 调整画布大小
+    function resize() {
+        width = window.innerWidth;
+        height = window.innerHeight;
+        canvas.width = width;
+        canvas.height = height;
+        maskCanvas.width = width;
+        maskCanvas.height = height;
+        initParticles(); // 重新生成文字粒子
+    }
+    window.addEventListener('resize', resize);
+
+    // ----------------------
+    // 1. 粒子系统类
+    // ----------------------
+    class Particle {
+        constructor(x, y) {
+            this.x = Math.random() * width; // 初始随机位置
+            this.y = Math.random() * height;
+            this.originX = x; // 目标文字位置
+            this.originY = y;
+            this.size = 2; // 粒子大小
+            this.color = '#4285f4'; // Google Blue
+            
+            // 随机分配 Google 颜色
+            const colors = ['#4285f4', '#ea4335', '#fbbc05', '#34a853'];
+            this.color = colors[Math.floor(Math.random() * colors.length)];
+            
+            this.vx = 0;
+            this.vy = 0;
+            this.friction = 0.90; // 摩擦力
+            this.ease = 0.1; // 回归速度
+        }
+
+        draw() {
+            ctx.fillStyle = this.color;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        update(maskData) {
+            // 检查当前粒子位置是否有“人” (蒙版检测)
+            // maskData 是一个 Uint8ClampedArray，每4个值代表一个像素 (R,G,B,A)
+            // 坐标 (x, y) 在数组中的索引是 (y * width + x) * 4
+            
+            let dx = this.originX - this.x;
+            let dy = this.originY - this.y;
+            let dist = dx * dx + dy * dy;
+            
+            let forceX = 0;
+            let forceY = 0;
+
+            // 简单的边界检查
+            const pX = Math.floor(this.x);
+            const pY = Math.floor(this.y);
+
+            let isTouchingPerson = false;
+
+            if (pX >= 0 && pX < width && pY >= 0 && pY < height && maskData) {
+                // 读取蒙版透明度或者红色通道。
+                // MediaPipe 默认输出：人物区域可能有特定的颜色，背景透明或黑色。
+                // 在我们的 drawSegmentation 逻辑里，人物是白色，背景黑色。
+                const index = (pY * width + pX) * 4;
+                const brightness = maskData[index]; // 读取红色通道即可 (黑白图)
+
+                // 如果 brightness > 128，说明是人物区域
+                if (brightness > 50) {
+                    isTouchingPerson = true;
+                }
+            }
+
+            if (isTouchingPerson) {
+                // 如果接触到人，产生强烈的随机排斥力，或者向周围散开
+                // 简单的排斥：计算粒子相对于屏幕中心的向量，向外推，或者随机散开
+                const angle = Math.random() * Math.PI * 2;
+                const pushForce = 5;
+                this.vx += Math.cos(angle) * pushForce;
+                this.vy += Math.sin(angle) * pushForce;
+                
+                // 也可以让颜色变亮
+                this.size = 4;
+            } else {
+                // 如果没人，慢慢回到文字原位
+                this.vx += dx * this.ease * 0.05;
+                this.vy += dy * this.ease * 0.05;
+                this.size = 2;
+            }
+
+            this.vx *= this.friction;
+            this.vy *= this.friction;
+
+            this.x += this.vx;
+            this.y += this.vy;
+        }
+    }
+
+    // ----------------------
+    // 2. 初始化粒子 (生成 GOOGLE 文字)
+    // ----------------------
+    function initParticles() {
+        particlesArray = [];
+        // 先在 Canvas 上画出文字
+        ctx.fillStyle = 'white';
+        // 根据屏幕宽度调整字体大小
+        let fontSize = width / 4; 
+        if (fontSize > 150) fontSize = 150;
+        
+        ctx.font = `bold ${fontSize}px Arial`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('GOOGLE', width / 2, height / 2);
+
+        // 获取文字的像素数据
+        const textCoordinates = ctx.getImageData(0, 0, width, height);
+        
+        // 扫描像素生成粒子
+        // step 决定粒子密度，越小粒子越多（性能消耗越大）
+        const step = 6; 
+        
+        for (let y = 0; y < height; y += step) {
+            for (let x = 0; x < width; x += step) {
+                // 检查 alpha 通道 > 128 (可见像素)
+                if (textCoordinates.data[(y * 4 * textCoordinates.width) + (x * 4) + 3] > 128) {
+                    particlesArray.push(new Particle(x, y));
+                }
+            }
+        }
+        // 清除画布，准备开始动画
+        ctx.clearRect(0, 0, width, height);
+    }
+
+    // ----------------------
+    // 3. MediaPipe 设置
+    // ----------------------
+    function onResults(results) {
+        // results.segmentationMask 是这一帧的分割蒙版
+        // 我们把它画到离屏 canvas 上，为了读取像素数据
+        maskCtx.save();
+        maskCtx.clearRect(0, 0, width, height);
+        // 将分割蒙版绘制成白色，人物区域
+        maskCtx.drawImage(results.segmentationMask, 0, 0, width, height);
+        
+        // 可以在这里把蒙版变成纯黑白，以便碰撞检测更准确
+        // MediaPipe 的 mask 已经是黑白的了 (或者是透明度)
+        // 我们利用 source-in 混合模式，给人物区域上色（例如纯白），背景保持透明/黑
+        maskCtx.globalCompositeOperation = 'source-in';
+        maskCtx.fillStyle = '#FFFFFF';
+        maskCtx.fillRect(0, 0, width, height);
+        
+        maskCtx.restore();
+
+        // 获取蒙版的像素数据 (性能瓶颈点，尽量优化)
+        // 为了性能，可以缩小 maskCanvas 的尺寸，这里为了演示精确度使用全尺寸
+        const maskData = maskCtx.getImageData(0, 0, width, height).data;
+
+        // 渲染主画面
+        renderScene(maskData);
+    }
+
+    const selfieSegmentation = new SelfieSegmentation({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`;
+    }});
+
+    selfieSegmentation.setOptions({
+        modelSelection: 1, // 0: general, 1: landscape (faster usually)
+        selfieMode: true, // 镜像模式，前置摄像头必须开启
+    });
+
+    selfieSegmentation.onResults(onResults);
+
+    // ----------------------
+    // 4. 渲染循环
+    // ----------------------
+    function renderScene(maskData) {
+        // 清除主画面
+        // 我们可以选择画一点半透明背景来制造拖尾效果，或者完全清除
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+        ctx.fillRect(0, 0, width, height);
+
+        // 绘制粒子
+        particlesArray.forEach(particle => {
+            particle.draw();
+            particle.update(maskData);
+        });
+    }
+
+    // ----------------------
+    // 5. 启动逻辑
+    // ----------------------
+    // 等待库加载完成
+    setTimeout(() => {
+        loadingDiv.innerHTML = "模型准备就绪<br>";
+        loadingDiv.appendChild(startBtn);
+        startBtn.style.display = "inline-block";
+    }, 2000);
+
+    startBtn.addEventListener('click', async () => {
+        loadingDiv.style.display = 'none';
+        
+        // 初始化画布尺寸
+        resize();
+
+        // 开启摄像头
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await selfieSegmentation.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720,
+            facingMode: 'user' // 强制前置
+        });
+        
+        await camera.start();
+    });
+
+</script>
+</body>
+</html>
